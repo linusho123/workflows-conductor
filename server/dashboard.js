@@ -17,7 +17,7 @@ const DATA_DIR = process.env.CONDUCTOR_DATA_DIR || path.join(os.homedir(), '.cla
 const IDLE_LIMIT_MS = 30 * 60 * 1000
 const HOOK_CLAIM_TTL_MS = 10 * 60 * 1000
 const JUST_FINISHED_MS = 5 * 60 * 1000
-const VERSION = '1.2.3'
+const VERSION = '1.2.4'
 
 if (!TOKEN) { console.error('CONDUCTOR_TOKEN required'); process.exit(2) }
 
@@ -893,7 +893,11 @@ es.onopen=()=>document.getElementById('dot').classList.add('live')
 es.onerror=()=>document.getElementById('dot').classList.remove('live')
 es.addEventListener('change',()=>{refresh();refreshLive()})
 es.addEventListener('theme',()=>{if(themePref==='ide')applyTheme()})
-es.addEventListener('tick',()=>{refresh();refreshLive(true)})
+// Self-healing stale tabs: the page knows the version it was served as;
+// if the server has moved on, reload once instead of running old code.
+const PAGE_V='${VERSION}'
+async function versionCheck(){try{const h=await (await fetch('/health')).json();if(h.version&&h.version!==PAGE_V)location.reload()}catch{}}
+es.addEventListener('tick',()=>{versionCheck();refresh();refreshLive(true)})
 // fast poll while anything is live; 1s in-place tick keeps timers moving
 setInterval(()=>{if(live&&Array.isArray(live.active)&&(live.active.length+(live.unattributed||[]).length))refreshLive()},5000)
 setInterval(tickLive,1000)
