@@ -17,7 +17,7 @@ const DATA_DIR = process.env.CONDUCTOR_DATA_DIR || path.join(os.homedir(), '.cla
 const IDLE_LIMIT_MS = 30 * 60 * 1000
 const HOOK_CLAIM_TTL_MS = 10 * 60 * 1000
 const JUST_FINISHED_MS = 5 * 60 * 1000
-const VERSION = '1.2.4'
+const VERSION = '1.2.5'
 
 if (!TOKEN) { console.error('CONDUCTOR_TOKEN required'); process.exit(2) }
 
@@ -110,6 +110,20 @@ async function liveState() {
   // mid-flight before any workflow subagent has stopped.
   const unattributed = hookLive.filter(h => !h.runId).map(h => ({ taskId: h.taskId, name: h.name, seenAt: h.seenAt }))
 
+  // Proactive enrichment (user request): don't wait for panels to be opened.
+  // The moment agents appear in an active run, queue their AI summaries —
+  // cached goals are immutable so this is one haiku call per agent, ever —
+  // and the existing summary→title upgrade renames junky derived titles live
+  // on the next poll. Plan summaries likewise generate as the run starts.
+  // Serialized queue + permanent cache bound the cost.
+  for (const r of active) {
+    if (!summaries['run:' + r.runId + ':plan']) enqueueRunSummary(r.runId, 'plan')
+    for (const a of r.agents ?? []) {
+      if ((a.titleSource === 'derived' || !a.title) && a.promptPreview && !summaries[r.runId + '/' + a.agentId]) {
+        enqueueSummary(r.runId, a.agentId)
+      }
+    }
+  }
   liveCache = { active, justFinished, unattributed, generatedAt: now }
   liveCacheAt = now
   return liveCache
