@@ -17,7 +17,7 @@ const DATA_DIR = process.env.CONDUCTOR_DATA_DIR || path.join(os.homedir(), '.cla
 const IDLE_LIMIT_MS = 30 * 60 * 1000
 const HOOK_CLAIM_TTL_MS = 10 * 60 * 1000
 const JUST_FINISHED_MS = 5 * 60 * 1000
-const VERSION = '1.2.1'
+const VERSION = '1.2.2'
 
 if (!TOKEN) { console.error('CONDUCTOR_TOKEN required'); process.exit(2) }
 
@@ -78,8 +78,20 @@ async function liveState() {
     const cand = all.liveCandidates.find(c => c.runId === runId)
     const hook = hookLive.find(h => h.runId === runId)
     const rec = all.runs.find(r => r.runId === runId)   // resumed runs have a (stale) record — with the name
+    for (const a of detail.agents ?? []) {
+      if (a.titleSource === 'derived' || !a.title) {
+        const cached = summaries[runId + '/' + a.agentId]
+        if (typeof cached === 'string' && cached.length > 10) {
+          // a title is a compressed summary: first clause, word-capped
+          let t = cached.replace(/^this agent (is |was )?/i, '').split(/[.;]/)[0].trim()
+          if (t.length > 46) t = t.slice(0, 46).replace(/\s+\S*$/, '')
+          if (t.length >= 10) { a.title = t; a.titleSource = 'summary' }
+        }
+      }
+    }
     active.push({
       runId, source,
+      labelsPending: detail.labelsPending ?? false,
       name: hook?.name ?? rec?.workflowName ?? detail.workflowName ?? null,
       description: detail.description ?? null,
       projectDir: cand?.projectDir ?? null,
@@ -118,7 +130,15 @@ async function persistSummaries() {
 }
 const summaryQueue = []
 const summaryInFlight = new Set()   // queued or running — dedupes repeat polls
-const summaryFailed = new Set()     // errored keys: reported as error, not retried this process
+// Errored keys retry with exponential backoff (60s, 2m, 4m ... cap 10m).
+// A transient CLI blip must not freeze a summary for the process lifetime.
+const summaryFailed = new Map()     // key -> { at, attempts }
+function summaryRetryable(key) {
+  const f = summaryFailed.get(key)
+  if (!f) return true
+  const wait = Math.min(60_000 * 2 ** (f.attempts - 1), 600_000)
+  return Date.now() - f.at > wait
+}
 let summaryPumping = false
 
 function summarizeViaCli(prompt) {
@@ -147,7 +167,7 @@ function summarizeViaCli(prompt) {
 
 function enqueueSummary(runId, agentId) {
   const key = runId + '/' + agentId
-  if (summaries[key] || summaryInFlight.has(key) || summaryFailed.has(key)) return
+  if (summaries[key] || summaryInFlight.has(key) || !summaryRetryable(key)) return
   summaryInFlight.add(key)
   summaryQueue.push({ kind: 'agent', runId, agentId, key })
   pumpSummaries()
@@ -157,7 +177,7 @@ function enqueueSummary(runId, agentId) {
 // summaries require a terminal record (the route gates on that).
 function enqueueRunSummary(runId, kind) {
   const key = 'run:' + runId + ':' + kind
-  if (summaries[key] || summaryInFlight.has(key) || summaryFailed.has(key)) return
+  if (summaries[key] || summaryInFlight.has(key) || !summaryRetryable(key)) return
   summaryInFlight.add(key)
   summaryQueue.push({ kind: 'run-' + kind, runId, key })
   pumpSummaries()
@@ -226,7 +246,15 @@ async function pumpSummaries() {
     try {
       summaries[item.key] = await summarizeViaCli(await buildSummaryPrompt(item))
       await persistSummaries()
-    } catch { summaryFailed.add(item.key) }   // never crash the server; log nothing (goals may hold secrets)
+    } catch (err) {
+      const prev = summaryFailed.get(item.key)
+      summaryFailed.set(item.key, { at: Date.now(), attempts: (prev?.attempts ?? 0) + 1 })
+      // Debug log: timings + error text only - NEVER the prompt/goal text.
+      try {
+        await fs.appendFile(path.join(DATA_DIR, 'summarizer.log'),
+          new Date().toISOString() + ' ' + item.key + ' attempt=' + ((prev?.attempts ?? 0) + 1) + ' err=' + String(err?.message ?? err).slice(0, 400) + '\n')
+      } catch { /* logging must never hurt */ }
+    }
     summaryInFlight.delete(item.key)
   }
   summaryPumping = false
@@ -332,7 +360,7 @@ const server = http.createServer(async (req, res) => {
       }
       const key = runId + '/' + agentId
       if (summaries[key]) return json(res, { state: 'ready', summary: summaries[key] })
-      if (summaryFailed.has(key)) return json(res, { state: 'error' })
+      if (summaryFailed.has(key) && !summaryRetryable(key)) return json(res, { state: 'error' })
       enqueueSummary(runId, agentId)
       return json(res, { state: 'pending' })
     }
@@ -344,7 +372,7 @@ const server = http.createServer(async (req, res) => {
       }
       const key = 'run:' + runId + ':' + kind
       if (summaries[key]) return json(res, { state: 'ready', summary: summaries[key] })
-      if (summaryFailed.has(key)) return json(res, { state: 'error' })
+      if (summaryFailed.has(key) && !summaryRetryable(key)) return json(res, { state: 'error' })
       // Result summaries only exist once a terminal record does; not an error —
       // the run may simply still be in flight.
       if (kind === 'result' && !(await getRun(runId)).found) return json(res, { state: 'unavailable' })
@@ -753,7 +781,7 @@ function rosterHtml(agents,drift,liveMode){
   }
   return h
 }
-function planHtml(runId,desc,phases,agents,drift,liveMode){
+function planHtml(runId,desc,phases,agents,drift,liveMode,labelsPending){
   let h='<div class="goal"><b>plan</b>'
   if(aiOn)h+=aiLine('run:'+runId+':plan','AI')
   if(desc)h+='<div>'+esc(desc)+'</div>'
@@ -764,7 +792,7 @@ function planHtml(runId,desc,phases,agents,drift,liveMode){
     h+=ph.map(p=>{const ti=typeof p==='string'?p:(p&&p.title)||'?';const on=liveMode&&cur===ti;return '<div'+(on?' style="color:var(--acc)"':' class="badge"')+'>'+(on?'▶ ':'· ')+esc(ti)+'</div>'}).join('')
   }
   h+='</div>'
-  return h+rosterHtml(agents||[],drift,liveMode)
+  return h+(labelsPending?'<div class="badge">agent names pending - this workflow computes labels at runtime; real names arrive when the run finishes</div>':'')+rosterHtml(agents||[],drift,liveMode)
 }
 function resultHtml(run){
   let h='<div class="goal"><b>result</b>'
@@ -790,7 +818,7 @@ async function loadDetail(id){
     if(lr){
       const n=(lr.agents||[]).length
       setHtml('dtitle','<h2>'+esc(lr.name??'—')+' <span class="badge">('+esc(shortRun(id))+')</span></h2><div class="mut">in flight · '+n+' agent'+(n===1?'':'s')+'</div>')
-      setHtml('dbody',planHtml(id,lr.description,lr.phases,lr.agents||[],Date.now()-liveAt,true))
+      setHtml('dbody',planHtml(id,lr.description,lr.phases,lr.agents||[],Date.now()-liveAt,true,lr.labelsPending))
       setHtml('dfoot',lr.description?'<div class="goal"><b>goal</b>'+esc(lr.description)+'</div>':'')
     }else{
       setHtml('dtitle','<h2>'+esc(id)+'</h2><div class="mut">in flight — no terminal record yet</div>')

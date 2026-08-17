@@ -553,6 +553,7 @@ export function deriveTitle(label, prompt) {
     let s = prompt
       .replace(/^#{1,6}\s+/gm, '')                           // markdown headings
       .replace(/[`*]/g, '')                                  // backticks, emphasis
+      .replace(/[\u2014\u2013\u2026]/g, '-')                    // no em/en dashes or ellipses in titles
     s = s.split('\n').map(l => l.trim()).find(l => l) ?? ''
     if (!s) return null
     // Leading boilerplate carries no identity — drop it (a couple of passes
@@ -570,7 +571,7 @@ export function deriveTitle(label, prompt) {
       let cut = s.slice(0, TITLE_MAX - 1)
       const sp = cut.lastIndexOf(' ')
       if (sp > 0) cut = cut.slice(0, sp)
-      s = cut.replace(/[\s.,;:!?—-]+$/, '') + '…'
+      s = cut.replace(/[\s.,;:!?—-]+$/, '')
     }
     return s
   } catch { return null }
@@ -685,10 +686,11 @@ export async function getLiveAgents(runId, { projectsDir = DEFAULT_PROJECTS_DIR,
     if (!r.title) { r.title = deriveTitle(null, r.promptPreview ?? null); r.titleSource = 'derived' }
   }
   disambiguateTitles(rows)
+  const labelsPending = labelPairs.length === 0 && /label\s*:/.test(src.found ? src.script : '') && rows.some(r => r.titleSource === 'derived')
   return {
     runId, found, phases, workflowName,
     description: src.found ? parseMetaDescription(src.script) : null,
-    agents: rows, script: undefined,
+    labelsPending, agents: rows, script: undefined,
   }
 }
 
@@ -737,27 +739,33 @@ export function disambiguateTitles(agents) {
   try {
     const fallbacks = agents.filter(a => a && a.titleSource === 'derived' && typeof a.promptPreview === 'string')
     if (fallbacks.length < 2) return
-    const titles = fallbacks.map(a => a.title).filter(Boolean)
-    if (new Set(titles).size === titles.length) return
-    const prompts = fallbacks.map(a => a.promptPreview)
-    let cp = prompts[0] ?? ''
-    for (const pr of prompts) { let i = 0; while (i < cp.length && i < pr.length && cp[i] === pr[i]) i++; cp = cp.slice(0, i) }
-    const cut = Math.max(0, cp.lastIndexOf(' '))
-    if (cut < 20) return
-    const proposed = fallbacks.map(a => {
-      // the divergence can land mid-word; skip the partial token
-      let tail = a.promptPreview.slice(cut).trim()
-      const sp = tail.search(/\s/)
-      if (sp > 0 && sp < 20 && !/^[A-Z][a-z]/.test(tail)) tail = tail.slice(sp).trim()
-      return deriveTitle(null, tail)
-    })
-    // quality gate: only adopt if the results are real words and distinct;
-    // otherwise keep the shared base title with honest #n suffixes
-    const good = proposed.every(t => t && t.length >= 12) && new Set(proposed).size === proposed.length
-    fallbacks.forEach((a, i) => {
-      a.title = good ? proposed[i] : (a.title ? a.title + ' #' + (i + 1) : null)
-    })
-  } catch { /* titles are cosmetic — never break the listing */ }
+    // Group by identical title; only colliding groups need work.
+    const groups = new Map()
+    for (const a of fallbacks) { const k = a.title ?? ''; (groups.get(k) ?? groups.set(k, []).get(k)).push(a) }
+    for (const [, g] of groups) {
+      if (g.length < 2) continue
+      const prompts = g.map(a => a.promptPreview)
+      let cp = prompts[0] ?? ''
+      for (const pr of prompts) { let i = 0; while (i < cp.length && i < pr.length && cp[i] === pr[i]) i++; cp = cp.slice(0, i) }
+      const cut = Math.max(0, cp.lastIndexOf(' '))
+      let adopted = false
+      if (cut >= 20) {
+        const proposed = g.map(a => {
+          let tail = a.promptPreview.slice(cut).trim()
+          const sp = tail.search(/\s/)
+          if (sp > 0 && sp < 20 && !/^[A-Z][a-z]/.test(tail)) tail = tail.slice(sp).trim()
+          return deriveTitle(null, tail)
+        })
+        if (proposed.every(t => t && t.length >= 12) && new Set(proposed).size === proposed.length) {
+          g.forEach((a, i) => { a.title = proposed[i] })
+          adopted = true
+        }
+      }
+      // Guaranteed distinctness: colliding titles always get #n, even when
+      // divergence failed (mixed preambles, short common prefixes, ...).
+      if (!adopted) g.forEach((a, i) => { a.title = a.title ? a.title + ' #' + (i + 1) : '#' + (i + 1) })
+    }
+  } catch { /* titles are cosmetic - never break the listing */ }
 }
 
 // The agent's goal: its task prompt is the FIRST line of its transcript

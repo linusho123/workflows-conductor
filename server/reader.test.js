@@ -350,7 +350,7 @@ test('deriveTitle: label wins; prompt distilled; garbage → null', () => {
     deriveTitle(null, 'You are a meticulous release auditor. Check every tag.'),
     'a meticulous release auditor')                           // boilerplate prefix dropped
   const long = deriveTitle(null, 'Refactor the authentication middleware layer to support rotating tokens')
-  assert.ok(long.endsWith('…') && long.length <= 42, `bad truncation: ${JSON.stringify(long)}`)
+  assert.ok(!/[\u2014\u2013\u2026]/.test(long) && long.length <= 42, `bad truncation: ${JSON.stringify(long)}`)   // clean word-boundary cut, no em/en/ellipsis chars
   assert.ok(long.startsWith('Refactor the authentication'))
   assert.equal(deriveTitle(null, null), null)
   assert.equal(deriveTitle(undefined, 42), null)
