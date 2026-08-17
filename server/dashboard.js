@@ -17,7 +17,7 @@ const DATA_DIR = process.env.CONDUCTOR_DATA_DIR || path.join(os.homedir(), '.cla
 const IDLE_LIMIT_MS = 30 * 60 * 1000
 const HOOK_CLAIM_TTL_MS = 10 * 60 * 1000
 const JUST_FINISHED_MS = 5 * 60 * 1000
-const VERSION = '1.2.5'
+const VERSION = '1.2.6'
 
 if (!TOKEN) { console.error('CONDUCTOR_TOKEN required'); process.exit(2) }
 
@@ -153,7 +153,6 @@ function summaryRetryable(key) {
   const wait = Math.min(60_000 * 2 ** (f.attempts - 1), 600_000)
   return Date.now() - f.at > wait
 }
-let summaryPumping = false
 
 function summarizeViaCli(prompt) {
   return new Promise((resolve, reject) => {
@@ -252,26 +251,33 @@ async function buildSummaryPrompt({ kind, runId, agentId }) {
 }
 
 // concurrency 1: at most one claude process at a time
+// Worker pool: eager enrichment queues many keys at once, and a single
+// slow/failing generation must not blockade the rest (head-of-line fix).
+const SUMMARY_WORKERS = 3
+let summaryActive = 0
 async function pumpSummaries() {
-  if (summaryPumping) return
-  summaryPumping = true
-  while (summaryQueue.length) {
+  while (summaryActive < SUMMARY_WORKERS && summaryQueue.length) {
     const item = summaryQueue.shift()
-    try {
-      summaries[item.key] = await summarizeViaCli(await buildSummaryPrompt(item))
-      await persistSummaries()
-    } catch (err) {
-      const prev = summaryFailed.get(item.key)
-      summaryFailed.set(item.key, { at: Date.now(), attempts: (prev?.attempts ?? 0) + 1 })
-      // Debug log: timings + error text only - NEVER the prompt/goal text.
+    summaryActive++
+    ;(async () => {
       try {
-        await fs.appendFile(path.join(DATA_DIR, 'summarizer.log'),
-          new Date().toISOString() + ' ' + item.key + ' attempt=' + ((prev?.attempts ?? 0) + 1) + ' err=' + String(err?.message ?? err).slice(0, 400) + '\n')
-      } catch { /* logging must never hurt */ }
-    }
-    summaryInFlight.delete(item.key)
+        summaries[item.key] = await summarizeViaCli(await buildSummaryPrompt(item))
+        await persistSummaries()
+      } catch (err) {
+        const prev = summaryFailed.get(item.key)
+        summaryFailed.set(item.key, { at: Date.now(), attempts: (prev?.attempts ?? 0) + 1 })
+        // Debug log: timings + error text only - NEVER the prompt/goal text.
+        try {
+          await fs.appendFile(path.join(DATA_DIR, 'summarizer.log'),
+            new Date().toISOString() + ' ' + item.key + ' attempt=' + ((prev?.attempts ?? 0) + 1) + ' err=' + String(err?.message ?? err).slice(0, 400) + '\n')
+        } catch { /* logging must never hurt */ }
+      } finally {
+        summaryInFlight.delete(item.key)
+        summaryActive--
+        pumpSummaries()
+      }
+    })()
   }
-  summaryPumping = false
 }
 
 // ── IDE theme: follow Cursor/VS Code's workbench.colorTheme so the page
