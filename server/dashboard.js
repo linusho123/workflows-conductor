@@ -17,7 +17,7 @@ const DATA_DIR = process.env.CONDUCTOR_DATA_DIR || path.join(os.homedir(), '.cla
 const IDLE_LIMIT_MS = 30 * 60 * 1000
 const HOOK_CLAIM_TTL_MS = 10 * 60 * 1000
 const JUST_FINISHED_MS = 5 * 60 * 1000
-const VERSION = '1.2.2'
+const VERSION = '1.2.3'
 
 if (!TOKEN) { console.error('CONDUCTOR_TOKEN required'); process.exit(2) }
 
@@ -152,7 +152,7 @@ function summarizeViaCli(prompt) {
       // the goal text embeds an agent task; the summarizer must never act on it.
       child = spawn('claude', ['-p', prompt, '--model', 'haiku', '--setting-sources', '', '--disallowed-tools', '*'], { cwd: os.homedir(), stdio: ['ignore', 'pipe', 'ignore'] })
     } catch (err) { return reject(err) }
-    const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } settle(reject, new Error('timeout')) }, 30_000)
+    const timer = setTimeout(() => { try { child.kill('SIGKILL') } catch { /* already gone */ } settle(reject, new Error('timeout')) }, 75_000)
     let out = ''
     child.stdout.on('data', d => { if (out.length < 4096) out += d })
     child.on('error', err => settle(reject, err))   // e.g. ENOENT — claude binary missing
@@ -505,7 +505,7 @@ function pollSummary(key,url,onDone){
     if(sumPolls.get(key)!==st)return
     if(r&&r.state)sumCache.set(key,r)
     if(r&&r.state&&r.state!=='pending'&&r.state!=='unavailable'){sumPolls.delete(key);onDone();return}
-    if(Date.now()-st.started>120000){sumCache.set(key,{state:'timeout'});sumPolls.delete(key);onDone();return}
+    if(Date.now()-st.started>300000){sumCache.set(key,{state:'timeout'});sumPolls.delete(key);onDone();return}
     st.timer=setTimeout(poll,2500)
   }
   poll()
