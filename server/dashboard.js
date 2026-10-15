@@ -80,8 +80,9 @@ async function liveState() {
     const rec = all.runs.find(r => r.runId === runId)   // resumed runs have a (stale) record — with the name
     for (const a of detail.agents ?? []) {
       a.name = agentName(a)
-      const t = composeTitle(a.name, summaries[agentKey(runId, a.agentId)], a.titleSource === 'derived' ? a.title : null)
-      if (t) { a.title = t; a.titleSource = 'summary' }
+      const phrase = summaries[agentKey(runId, a.agentId)], fallback = a.titleSource === 'derived' ? a.title : null
+      const t = composeTitle(a.name, phrase, fallback)
+      if (t) { a.titleFull = composeTitle(a.name, phrase, fallback, Infinity); a.title = t; a.titleSource = 'summary' }
     }
     active.push({
       runId, source,
@@ -168,9 +169,10 @@ function nameLine(name, phrase) {
 }
 // name + cached phrase (or fallback text) -> display title; null keeps the
 // existing title (e.g. a label alone while its summary is pending).
-function composeTitle(name, phrase, fallback) {
-  if (typeof phrase === 'string' && phrase) return capLen(nameLine(name, phrase), name ? 72 : 60)
-  if (name && fallback) return capLen(name + ': ' + fallback, 72)
+// max = Infinity yields the untruncated line (the row's hover text).
+function composeTitle(name, phrase, fallback, max) {
+  if (typeof phrase === 'string' && phrase) return capLen(nameLine(name, phrase), max ?? (name ? 72 : 60))
+  if (name && fallback) return capLen(name + ': ' + fallback, max ?? 72)
   return null
 }
 // Normalize the model's reply to a bare phrase; null = unusable (refusal,
@@ -539,7 +541,8 @@ const when=ts=>ts?new Date(ts).toLocaleString():'—'
 const shortProj=p=>{const s=String(p||'').split('-').filter(Boolean);return s.length?s.slice(-2).join('-'):'(no project)'}
 const shortRun=id=>String(id).replace(/^wf_/,'').slice(0,8)
 const shortAg=id=>String(id).slice(0,8)
-const nameCell=(name,idShort)=>(name?esc(name)+' ':'')+'<span class="badge">('+esc(idShort)+')</span>'
+// full: untruncated text, shown on hover when the name was cut short
+const nameCell=(name,idShort,full)=>(name?(full&&full!==name?'<span title="'+esc(full)+'">'+esc(name)+'</span>':esc(name))+' ':'')+'<span class="badge">('+esc(idShort)+')</span>'
 // ── write-on-change panel regions: identical HTML is never rewritten, so a
 // static goal is written once per agent and its scroll can never reset ──
 const lastHtml=new Map()
@@ -661,7 +664,7 @@ function subRowHtml(runId,a,drift){
   const tok=a.outputTokens??a.tokens
   const durMs=a.elapsedMs??a.durationMs
   return '<tr class="sub" data-run="'+esc(runId)+'" data-agent="'+esc(a.agentId)+'">'+
-    '<td><span class="'+b.dot+'"></span>'+nameCell(a.title??a.label??null,shortAg(a.agentId))+'</td>'+
+    '<td><span class="'+b.dot+'"></span>'+nameCell(a.title??a.label??null,shortAg(a.agentId),a.titleFull)+'</td>'+
     '<td><span class="s '+b.statusCls+' ast">'+esc(b.statusText)+'</span></td>'+
     '<td></td>'+
     '<td>'+(tok!=null?fmt(tok):'')+'</td>'+
@@ -833,7 +836,7 @@ function rosterHtml(agents,drift,liveMode){
   for(const a of agents){
     const b=agentBadge(a,drift)
     const tok=a.outputTokens??a.tokens
-    h+='<div class="agent"><span class="'+b.dot+'"></span><b>'+nameCell(a.title??a.label??null,shortAg(a.agentId))+'</b> <span class="s '+b.statusCls+'">'+esc(b.statusText)+'</span>'+
+    h+='<div class="agent"><span class="'+b.dot+'"></span><b>'+nameCell(a.title??a.label??null,shortAg(a.agentId),a.titleFull)+'</b> <span class="s '+b.statusCls+'">'+esc(b.statusText)+'</span>'+
       (tok!=null?' <span class="badge">'+fmt(tok)+' tok</span>':'')+
       (liveMode?'<span class="mut" style="white-space:nowrap;word-break:normal;overflow:hidden;text-overflow:ellipsis">'+esc(actionText(a.currentAction))+'</span>':'')+'</div>'
   }
