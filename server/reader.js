@@ -768,40 +768,51 @@ export function disambiguateTitles(agents) {
   } catch { /* titles are cosmetic - never break the listing */ }
 }
 
-// Billable usage from a WHOLE transcript, for cost estimates. A streamed
+// Whole-transcript stats: billable usage (for cost estimates) plus the
+// compaction and model-fallback markers the CLI writes. A streamed
 // response is logged once per content block, each line repeating its usage
 // with output_tokens growing — so keep the final (max-output) line per
 // requestId; summing lines over-counts ~2x. Transcripts are append-only:
 // cached per path and read incrementally from the last offset.
-const usageCache = new Map()   // path -> { offset, partial, reqs: Map(requestId -> entry) }
-export async function readTranscriptUsage(filePath) {
+const usageCache = new Map()   // path -> { offset, partial, reqs: Map(requestId -> entry), compactions, modelFallbacks }
+export async function readTranscriptStats(filePath) {
   if (!filePath) return null
   let c = usageCache.get(filePath)
   let fh = null
   try {
     fh = await fs.open(filePath, 'r')
     const { size } = await fh.stat()
-    if (!c || size < c.offset) { c = { offset: 0, partial: '', reqs: new Map() }; usageCache.set(filePath, c) }
+    if (!c || size < c.offset) { c = { offset: 0, partial: '', reqs: new Map(), compactions: [], modelFallbacks: 0 }; usageCache.set(filePath, c) }
     if (size > c.offset) {
       const buf = Buffer.alloc(size - c.offset)
       const { bytesRead } = await fh.read(buf, 0, buf.length, c.offset)
       c.offset += bytesRead
       const lines = (c.partial + buf.subarray(0, bytesRead).toString('utf8')).split('\n')
       c.partial = lines.pop()   // torn/in-progress trailing line: finish it next read
-      for (const seg of lines) addUsageLine(c.reqs, seg)
+      for (const seg of lines) addStatsLine(c, seg)
     }
   } catch {
     return null
   } finally {
     if (fh) await fh.close().catch(() => {})
   }
-  return summarizeUsage(c.reqs)
+  const usage = summarizeUsage(c.reqs)
+  return { usage, outputTokens: usage.reduce((s, b) => s + b.output, 0), compactions: c.compactions, modelFallbacks: c.modelFallbacks }
 }
 
-function addUsageLine(reqs, seg) {
-  if (!seg.includes('"usage"')) return
+function addStatsLine(c, seg) {
+  const isUsage = seg.includes('"usage"'), isSystem = seg.includes('"compact_boundary"') || seg.includes('"model_refusal_fallback"')
+  if (!isUsage && !isSystem) return
   let line
   try { line = JSON.parse(seg) } catch { return }
+  if (line?.type === 'system') {
+    if (line.subtype === 'compact_boundary') {
+      const md = line.compactMetadata ?? {}
+      c.compactions.push({ at: line.timestamp ?? null, trigger: md.trigger ?? null, preTokens: md.preTokens ?? null, durationMs: md.durationMs ?? null })
+    } else if (line.subtype === 'model_refusal_fallback') c.modelFallbacks++
+    return
+  }
+  const reqs = c.reqs
   const m = line?.message, u = m?.usage
   if (line?.type !== 'assistant' || !u || typeof m.model !== 'string') return
   const key = line.requestId ?? m.id

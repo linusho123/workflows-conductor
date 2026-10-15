@@ -9,7 +9,8 @@ import { promises as fs, watch } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
 import { spawn } from 'node:child_process'
-import { listRuns, getRun, getAgents, getLiveAgents, getScript, parseMetaDescription, parseTranscriptTail, readTranscriptPrompt, deriveTitle, DEFAULT_PROJECTS_DIR } from './reader.js'
+import { listRuns, getRun, getAgents, getLiveAgents, getScript, parseMetaDescription, parseTranscriptTail, readTranscriptPrompt, readTranscriptStats, deriveTitle, DEFAULT_PROJECTS_DIR } from './reader.js'
+import { estimateCost, PRICES_AS_OF } from './pricing.js'
 
 const PORT = Number(process.env.CONDUCTOR_PORT || 7423)
 const TOKEN = process.env.CONDUCTOR_TOKEN
@@ -75,6 +76,7 @@ async function liveState() {
   const active = []
   for (const [runId, source] of activeIds) {
     const detail = await getLiveAgents(runId, { dataDir: DATA_DIR, now })
+    for (const a of detail.agents ?? []) await withStats(a, { live: true })
     const cand = all.liveCandidates.find(c => c.runId === runId)
     const hook = hookLive.find(h => h.runId === runId)
     const rec = all.runs.find(r => r.runId === runId)   // resumed runs have a (stale) record — with the name
@@ -99,6 +101,7 @@ async function liveState() {
       resumedAfter: cand?.resumedAfter ?? null,
       phases: detail.phases ?? [],
       agents: detail.agents ?? [],
+      ...rollupCost(detail.agents ?? []),
     })
   }
 
@@ -127,6 +130,52 @@ async function liveState() {
   liveCache = { active, justFinished, unattributed, generatedAt: now }
   liveCacheAt = now
   return liveCache
+}
+
+// ── Estimated cost: whole-transcript usage priced at list rates (pricing.js).
+// Compaction's own summarization call isn't logged in the transcript, so a
+// compacted agent's estimate is a lower bound — flagged as partial. ──
+async function agentStats(transcriptPath) {
+  const st = await readTranscriptStats(transcriptPath)
+  if (!st) return null
+  const { usd, unpriced } = await estimateCost(st.usage, { dataDir: DATA_DIR })
+  return { costUsd: st.usage.length ? usd : null, costUnpriced: unpriced, compactions: st.compactions, modelFallbacks: st.modelFallbacks, outputTotal: st.outputTokens, usage: st.usage }
+}
+// live: the tail-window token sum counted every streamed line — replace it
+// with the per-request output total.
+async function withStats(a, { live = false } = {}) {
+  if (!a?.transcriptPath) return a
+  const s = await agentStats(a.transcriptPath)
+  if (s) { Object.assign(a, s); if (live) a.outputTokens = s.outputTotal }
+  return a
+}
+function rollupCost(agents) {
+  const priced = agents.filter(a => a.costUsd != null)
+  return {
+    costUsd: priced.length ? priced.reduce((s, a) => s + a.costUsd, 0) : null,
+    costPartial: agents.some(a => a.costUnpriced?.length || a.compactions?.length || (a.transcriptPath && a.costUsd == null)),
+    compactionCount: agents.reduce((s, a) => s + (a.compactions?.length ?? 0), 0),
+  }
+}
+// Finished runs are immutable: cost each once in the background (~100MB of
+// transcripts the first time), then announce it so open tabs refresh.
+const runCosts = new Map()   // runId -> rollupCost
+let costScanBusy = false
+async function scanRunCosts(runIds) {
+  if (costScanBusy) return
+  costScanBusy = true
+  let added = 0
+  try {
+    for (const id of runIds) {
+      if (runCosts.has(id)) continue
+      const ags = (await getAgents(id)).agents
+      for (const a of ags) await withStats(a)
+      runCosts.set(id, rollupCost(ags))
+      added++
+      await new Promise(r => setImmediate(r))   // keep the server responsive
+    }
+  } catch { /* a vanished run: skip; retried on the next listing */ } finally { costScanBusy = false }
+  if (added) broadcast('change')
 }
 
 // ── AI summaries: one-sentence Haiku summaries of agent goals via the user's
@@ -356,6 +405,10 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/runs') {
       const runs = await listRuns({ scope: 'all', limit: Number(url.searchParams.get('limit') || 100) })
       const hookLive = await liveFromHookEvents({ recordedIds: new Set(runs.runs.map(r => r.runId)) })
+      for (const r of runs.runs) Object.assign(r, runCosts.get(r.runId) ?? {})
+      // resumed runs have a record but are still growing: never cache those
+      const liveIds = new Set((runs.liveCandidates ?? []).map(c => c.runId))
+      scanRunCosts(runs.runs.map(r => r.runId).filter(id => !liveIds.has(id)))
       return json(res, { ...runs, hookLive })
     }
     if (url.pathname === '/api/live') return json(res, await liveState())
@@ -371,7 +424,7 @@ const server = http.createServer(async (req, res) => {
       const agent = ag.agents.find(a => a.agentId === agentId)
       if (!agent?.transcriptPath) return json(res, { error: 'no transcript for that agent' }, 404)
       const goal = (await readTranscriptPrompt(agent.transcriptPath)) ?? agent.promptPreview
-      return json(res, { runId, agentId, goal, label: agent.label ?? null, title: agent.title ?? deriveTitle(agent.label ?? null, goal ?? null), ...(await parseTranscriptTail(agent.transcriptPath)) })
+      return json(res, { runId, agentId, goal, label: agent.label ?? null, title: agent.title ?? deriveTitle(agent.label ?? null, goal ?? null), ...(await parseTranscriptTail(agent.transcriptPath)), ...(await agentStats(agent.transcriptPath)) })
     }
     if (url.pathname.startsWith('/api/summary/')) {
       // Same id discipline as /api/tail — never a client-supplied path.
@@ -409,7 +462,11 @@ const server = http.createServer(async (req, res) => {
       }
       return json(res, run)
     }
-    if (url.pathname.startsWith('/api/agents/')) return json(res, await getAgents(url.pathname.split('/')[3]))
+    if (url.pathname.startsWith('/api/agents/')) {
+      const ag = await getAgents(url.pathname.split('/')[3])
+      for (const a of ag.agents) await withStats(a)
+      return json(res, ag)
+    }
     if (url.pathname === '/shutdown' && req.method === 'POST') { json(res, { bye: true }); return setTimeout(() => process.exit(0), 50) }
     if (url.pathname === '/events') {
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' })
@@ -563,9 +620,30 @@ async function ensureAgents(runId){
   try{const r=await q('/api/agents/'+encodeURIComponent(runId));if(Array.isArray(r.agents))agentsCache.set(runId,r.agents)}catch{}
   agFetching.delete(runId);render()
 }
-const COLS=[['name','name'],['status','status'],['agentCount','agents'],['totalTokens','tokens'],['durationMs','dur'],['defaultModel','model'],['timestamp','when'],['projectDir','project']]
+const COLS=[['name','name'],['status','status'],['agentCount','agents'],['totalTokens','tokens'],['costUsd','est. cost'],['durationMs','dur'],['defaultModel','model'],['timestamp','when'],['projectDir','project']]
 const shortModel=m=>m?String(m).replace(/^claude-/,''):''
-const NUM=new Set(['agentCount','totalTokens','durationMs'])
+const NUM=new Set(['agentCount','totalTokens','costUsd','durationMs'])
+// Estimated API cost at list prices; '+' marks a lower bound (unpriced model,
+// or compaction calls the transcript doesn't record).
+const PRICES_AS_OF='${PRICES_AS_OF}'
+function costCell(usd,partial,why){
+  if(usd==null)return '<td class="badge">—</td>'
+  const s='$'+(usd<0.01?usd.toFixed(3):usd<100?usd.toFixed(2):Math.round(usd).toLocaleString())
+  const tip='Estimated API cost at Anthropic list prices (as of '+PRICES_AS_OF+'). Not a subscription bill.'+(partial?' Lower bound: '+(why||'some usage not priced')+'.':'')
+  return '<td title="'+esc(tip)+'">'+s+(partial?'+':'')+'</td>'
+}
+function partialWhy(a){
+  const r=[]
+  if(a.costUnpriced&&a.costUnpriced.length)r.push('no price for '+a.costUnpriced.join(', '))
+  if(a.compactions&&a.compactions.length)r.push('compaction calls not in transcript')
+  return r.join('; ')
+}
+// ⟲n badge: the agent's context was compacted n times.
+function cmpBadge(list){
+  if(!list||!list.length)return ''
+  const tip=list.map(c=>(c.trigger||'?')+(c.preTokens?' at '+Math.round(c.preTokens/1000)+'K tokens':'')+(c.at?' · '+new Date(c.at).toLocaleTimeString():'')).join('\\n')
+  return ' <span class="badge cmp" title="'+esc('compacted '+list.length+'×\\n'+tip)+'">⟲'+list.length+'</span>'
+}
 function cmp(a,b){
   if(sortKey==='name'){ // merged column: workflowName first, runId breaks ties
     const wx=String(a.workflowName??'').toLowerCase(),wy=String(b.workflowName??'').toLowerCase()
@@ -591,6 +669,7 @@ function liveRows(){
       runId:r.runId,workflowName:r.name??null,status,statusRecognized:true,compat:'ok',
       agentCount:agents.length||null,
       totalTokens:agents.reduce((s,a)=>s+(a.outputTokens||0),0)||null,
+      costUsd:r.costUsd??null,costPartial:!!r.costPartial,compactionCount:r.compactionCount||0,
       durationMs:Math.max(0,...agents.map(a=>a.elapsedMs||0))||null,
       defaultModel:agents.map(a=>a.model).find(Boolean)??null,
       timestamp:r.lastActivity??new Date(liveAt).toISOString(),
@@ -608,14 +687,14 @@ function rowHtml(r){
   const cls=r.isLive?(r.status.startsWith('stale')?'stale':'live'):(r.status==='completed'?'completed':(r.statusRecognized?'killed':'unk'))
   const warn=r.compat!=='ok'?' <span class="badge">⚠ '+esc(r.compat)+'</span>':''
   const durCell=r.isLive?'<td class="ldur" data-base="'+(r.durationMs??0)+'">'+(r.durationMs!=null?ago(r.durationMs+drift):'—')+'</td>':'<td>'+dur(r.durationMs)+'</td>'
-  let html='<tr class="run'+(sel===r.runId?' sel':'')+(r.isLive?' lrun':'')+'" data-id="'+esc(r.runId)+'"'+(r.noPick?' data-nopick="1"':'')+'><td>'+(r.isLive?'<span class="pdot on"></span>':(r.agentCount?'<span class="xp">'+(expanded.has(r.runId)?'▾':'▸')+'</span>':''))+(r.noPick?'':INFO_BTN)+nameCell(r.workflowName??'—',shortRun(r.runId))+warn+'</td><td><span class="s '+cls+'">'+esc(r.status)+'</span></td><td>'+fmt(r.agentCount)+'</td><td>'+fmt(r.totalTokens)+'</td>'+durCell+'<td class="badge">'+esc(shortModel(r.defaultModel))+'</td><td>'+when(r.timestamp)+'</td><td class="badge">'+esc(r.projectDir??'')+'</td></tr>'
+  let html='<tr class="run'+(sel===r.runId?' sel':'')+(r.isLive?' lrun':'')+'" data-id="'+esc(r.runId)+'"'+(r.noPick?' data-nopick="1"':'')+'><td>'+(r.isLive?'<span class="pdot on"></span>':(r.agentCount?'<span class="xp">'+(expanded.has(r.runId)?'▾':'▸')+'</span>':''))+(r.noPick?'':INFO_BTN)+nameCell(r.workflowName??'—',shortRun(r.runId))+(r.compactionCount?' <span class="badge cmp" title="'+r.compactionCount+' compaction'+(r.compactionCount===1?'':'s')+' across agents">⟲'+r.compactionCount+'</span>':'')+warn+'</td><td><span class="s '+cls+'">'+esc(r.status)+'</span></td><td>'+fmt(r.agentCount)+'</td><td>'+fmt(r.totalTokens)+'</td>'+costCell(r.costUsd,r.costPartial,r.costPartial?'some agents not fully priced':'')+durCell+'<td class="badge">'+esc(shortModel(r.defaultModel))+'</td><td>'+when(r.timestamp)+'</td><td class="badge">'+esc(r.projectDir??'')+'</td></tr>'
   // Agent sub-rows use the SAME columns as runs. Live rows always show them;
   // finished rows expand on demand (agents fetched lazily into agentsCache).
   if(r.isLive)for(const a of r.agents)html+=subRowHtml(r.runId,a,drift)
   else if(expanded.has(r.runId)){
     const ags=agentsCache.get(r.runId)
     if(ags)for(const a of ags)html+=subRowHtml(r.runId,a,0)
-    else html+='<tr class="sub"><td colspan=8 class="badge">loading agents…</td></tr>'
+    else html+='<tr class="sub"><td colspan=9 class="badge">loading agents…</td></tr>'
   }
   return html
 }
@@ -624,10 +703,11 @@ function subRowHtml(runId,a,drift){
   const tok=a.outputTokens??a.tokens
   const durMs=a.elapsedMs??a.durationMs
   return '<tr class="sub" data-run="'+esc(runId)+'" data-agent="'+esc(a.agentId)+'">'+
-    '<td><span class="'+b.dot+'"></span>'+nameCell(a.title??a.label??null,shortAg(a.agentId))+'</td>'+
+    '<td><span class="'+b.dot+'"></span>'+nameCell(a.title??a.label??null,shortAg(a.agentId))+cmpBadge(a.compactions)+'</td>'+
     '<td><span class="s '+b.statusCls+' ast">'+esc(b.statusText)+'</span></td>'+
     '<td></td>'+
     '<td>'+(tok!=null?fmt(tok):'')+'</td>'+
+    costCell(a.costUsd??null,!!(a.costUnpriced&&a.costUnpriced.length)||!!(a.compactions&&a.compactions.length),partialWhy(a))+
     '<td class="adur" data-base="'+(a.elapsedMs??'')+'" data-run-state="'+(b.running?'1':'')+'">'+(durMs!=null?(b.running?ago(b.elapsed):dur(durMs)):'')+'</td>'+
     '<td class="badge">'+esc(shortModel(a.model))+'</td>'+
     '<td>'+(a.lastActivityAt?when(a.lastActivityAt):'')+'</td>'+
@@ -657,12 +737,12 @@ function render(){
     for(const r of runs){const k=r.projectDir??'';(groups.get(k)??groups.set(k,[]).get(k)).push(r)}
     for(const [k,rs] of groups){
       const open=!collapsed.has(k)||rs.some(r=>r.isLive)   // never hide a live run behind a collapsed group
-      html+='<tr class="grp" data-gk="'+esc(k)+'"><td colspan=8>'+(open?'▾ ':'▸ ')+esc(shortProj(k))+' <span class="badge">('+rs.length+' run'+(rs.length===1?'':'s')+')</span></td></tr>'
+      html+='<tr class="grp" data-gk="'+esc(k)+'"><td colspan=9>'+(open?'▾ ':'▸ ')+esc(shortProj(k))+' <span class="badge">('+rs.length+' run'+(rs.length===1?'':'s')+')</span></td></tr>'
       if(open)html+=rs.map(rowHtml).join('')
     }
   }else html=runs.map(rowHtml).join('')
   const emptyMsg=statusFilter==='active'?'No active runs right now':(((data&&data.runs)||[]).length?'No runs match the filter':'No workflow runs found — launch one with an ultracode: prompt (CLI ≥ 2.1.154)')
-  document.getElementById('rows').innerHTML=html||'<tr><td colspan=8 class="badge">'+emptyMsg+'</td></tr>'
+  document.getElementById('rows').innerHTML=html||'<tr><td colspan=9 class="badge">'+emptyMsg+'</td></tr>'
 }
 // ── Active Runs (F2/F4): fed by /api/live, elapsed ticks locally between polls ──
 let live=null,liveAt=0,selTail=null
@@ -734,6 +814,20 @@ function sumHtml(t,runId,agentId){
   if(t.lastTimestamp)parts.push('last active '+ago(Date.now()-new Date(t.lastTimestamp).getTime())+' ago')
   let h='<div class="goal"><b>summary</b>'+parts.filter(Boolean).join(' · ')
   if(aiOn)h+=aiLine(runId+'/'+agentId,'AI summary')
+  return h+'</div>'+usageHtml(t)
+}
+// Token breakdown across all requests: cache reads usually dominate volume,
+// which is why raw token counts mislead about cost.
+function usageHtml(t){
+  if(!t.usage||!t.usage.length)return ''
+  const sum=k=>t.usage.reduce((s,b)=>s+(b[k]||0),0)
+  const rows=[['input',sum('input')],['cache write',sum('cacheWrite5m')+sum('cacheWrite1h')],['cache read',sum('cacheRead')],['output',sum('output')]]
+  let h='<div class="goal"><b>usage</b>'+rows.map(r=>r[0]+' '+fmt(r[1])).join(' · ')+' · '+fmt(sum('requests'))+' requests'
+  const models=[...new Set(t.usage.map(b=>shortModel(b.model)+(b.tier==='fast'?' (fast)':'')))]
+  if(models.length>1)h+=' · '+esc(models.join(', '))
+  if(t.costUsd!=null)h+='<br>est. cost $'+t.costUsd.toFixed(2)+(partialWhy(t)?' (lower bound: '+esc(partialWhy(t))+')':'')
+  if(t.compactions&&t.compactions.length)h+='<br>'+t.compactions.map(c=>'compacted ('+esc(c.trigger||'?')+')'+(c.preTokens?' at '+fmt(c.preTokens)+' tokens':'')+(c.at?' · '+esc(new Date(c.at).toLocaleString()):'')).join('<br>')
+  if(t.modelFallbacks)h+='<br>'+t.modelFallbacks+' model fallback'+(t.modelFallbacks===1?'':'s')+' after a safeguard refusal'
   return h+'</div>'
 }
 async function loadTail(runId,agentId){
@@ -745,7 +839,7 @@ async function loadTail(runId,agentId){
     return '<div class="tev badge">↳ tool result</div>'
   }).join('')
   setHtml('dtitle','<h2>'+esc(t.title??t.label??'agent')+' <span class="badge">('+esc(shortAg(agentId))+')</span></h2><div class="mut">'+esc(runId)+' · '+esc(agentId.slice(0,10))+'…'+
-    (t.model?' · '+esc(String(t.model).replace(/^claude-/,'')):'')+(t.outputTokens?' · '+fmt(t.outputTokens)+' output tok (window)':'')+'</div>')
+    (t.model?' · '+esc(String(t.model).replace(/^claude-/,'')):'')+(t.outputTotal!=null?' · '+fmt(t.outputTotal)+' output tok':'')+(t.costUsd!=null?' · $'+t.costUsd.toFixed(2)+' est.':'')+'</div>')
   // dfoot splits into two independently-tracked regions: the summary line may
   // tick every refresh, but the goal block below it is written once per agent
   // so its scroll position survives feed refreshes.
