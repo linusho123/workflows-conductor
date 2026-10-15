@@ -8,7 +8,8 @@ import assert from 'node:assert/strict'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { listRuns, getRun, getAgents, getScript, saveAsWorkflow, encodeCwd, parseTranscriptTail, parsePhases, parseMetaDescription, deriveTitle, parseAgentLabels, matchLabel, getLiveAgents } from './reader.js'
+import { listRuns, getRun, getAgents, getScript, saveAsWorkflow, encodeCwd, parseTranscriptTail, parsePhases, parseMetaDescription, deriveTitle, parseAgentLabels, matchLabel, getLiveAgents, readTranscriptStats } from './reader.js'
+import { estimateCost } from './pricing.js'
 
 let root, projectsDir, cwdA, cwdB
 const now = Date.now()
@@ -473,4 +474,72 @@ test('deriveTitle strips ownership boilerplate', () => {
   const t = deriveTitle(null, 'You own EXACTLY server/reader.js in the repo. Add resultSections to getRun for panel rendering.')
   assert.ok(t && !/^you own/i.test(t), t)
   assert.ok(/resultSections|Add/i.test(t), t)
+})
+
+// One logged line of a streamed response: every content block repeats the
+// request's usage, with output_tokens growing until the final line.
+function usageLine(requestId, model, u) {
+  return JSON.stringify({ type: 'assistant', requestId, message: { id: 'msg_' + requestId, model, content: [{ type: 'text', text: 'x' }],
+    usage: { input_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 }, output_tokens: 0, ...u } } })
+}
+
+test('readTranscriptStats: one entry per request (final line), incremental appends, torn line deferred, tiers', async () => {
+  const p = path.join(root, 'usage', 'agent-u1.jsonl')
+  const cw = n => ({ cache_creation_input_tokens: n, cache_creation: { ephemeral_5m_input_tokens: n, ephemeral_1h_input_tokens: 0 } })
+  await write(p, [
+    usageLine('r1', 'claude-sonnet-5-5', { ...cw(1000), cache_read_input_tokens: 5000, output_tokens: 5 }),
+    usageLine('r1', 'claude-sonnet-5-5', { ...cw(1000), cache_read_input_tokens: 5000, output_tokens: 300 }),
+    usageLine('r1', 'claude-sonnet-5-5', { ...cw(1000), cache_read_input_tokens: 5000, output_tokens: 300 }),
+    JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } }),
+  ].join('\n') + '\n')
+  let u = (await readTranscriptStats(p)).usage
+  assert.equal(u.length, 1)
+  assert.deepEqual({ ...u[0] }, { model: 'claude-sonnet-5-5', tier: 'standard', requests: 1, input: 2, cacheWrite5m: 1000, cacheWrite1h: 0, cacheRead: 5000, output: 300, webSearches: 0 })
+
+  // Append a fast-mode request, a >100K-prompt request, and a torn trailing line.
+  const torn = usageLine('r4', 'claude-sonnet-5-5', { output_tokens: 9 })
+  await fs.appendFile(p, [
+    usageLine('r2', 'claude-opus-5-5', { output_tokens: 10 }),
+    usageLine('r2', 'claude-opus-5-5', { output_tokens: 50, speed: 'fast' }),
+    usageLine('r3', 'claude-haiku-5-5', { cache_read_input_tokens: 150_000, output_tokens: 20 }),
+  ].join('\n') + '\n' + torn.slice(0, 40))
+  u = (await readTranscriptStats(p)).usage
+  const by = Object.fromEntries(u.map(b => [b.model + '|' + b.tier, b]))
+  assert.equal(by['claude-opus-5-5|fast'].output, 50)
+  assert.equal(by['claude-haiku-5-5|long'].cacheRead, 150_000)
+  assert.equal(u.reduce((s, b) => s + b.requests, 0), 3, 'torn r4 not counted yet')
+
+  await fs.appendFile(p, torn.slice(40) + '\n')
+  u = (await readTranscriptStats(p)).usage
+  assert.equal(u.reduce((s, b) => s + b.requests, 0), 4, 'r4 counted once completed')
+  assert.equal(u.find(x => x.model === 'claude-sonnet-5-5' && x.tier === 'standard').output, 300 + 9, 'r1 not re-counted; r4 added')
+
+  // Compaction + model-fallback markers, and the output total.
+  await fs.appendFile(p, [
+    JSON.stringify({ type: 'system', subtype: 'compact_boundary', content: 'Conversation compacted', timestamp: '2026-10-15T01:00:00Z', compactMetadata: { trigger: 'auto', preTokens: 990000, durationMs: 65000 } }),
+    JSON.stringify({ type: 'system', subtype: 'model_refusal_fallback', content: 'Switched to Opus' }),
+  ].join('\n') + '\n')
+  const st = await readTranscriptStats(p)
+  assert.deepEqual(st.compactions, [{ at: '2026-10-15T01:00:00Z', trigger: 'auto', preTokens: 990000, durationMs: 65000 }])
+  assert.equal(st.modelFallbacks, 1)
+  assert.equal(st.outputTokens, 300 + 50 + 20 + 9)
+})
+
+test('estimateCost: list prices, cache multipliers, fast/long tiers, unpriced models, data-dir overrides', async () => {
+  const b = (model, tier, o) => ({ model, tier, requests: 1, input: 0, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0, output: 0, webSearches: 0, ...o })
+  const close = (a, e) => assert.ok(Math.abs(a - e) < 1e-9, `${a} vs ${e}`)
+  // Sonnet 5.5: 1M in $2, 1M 5m-write $2.50, 1M 1h-write $4, 1M read $0.20, 1M out $10.
+  close((await estimateCost([b('claude-sonnet-5-5', 'standard', { input: 1e6, cacheWrite5m: 1e6, cacheWrite1h: 1e6, cacheRead: 1e6, output: 1e6 })])).usd, 2 + 2.5 + 4 + 0.2 + 10)
+  close((await estimateCost([b('claude-opus-5-5', 'fast', { output: 1e6 })])).usd, 40)
+  close((await estimateCost([b('claude-haiku-5-5', 'long', { output: 1e6 })])).usd, 2.5)
+  close((await estimateCost([b('claude-sonnet-5-5', 'long', { output: 1e6 })])).usd, 10, 'no long tier -> standard rates')
+  close((await estimateCost([b('claude-haiku-4-5-20251001', 'standard', { output: 1e6 })])).usd, 5, 'dated id prices as its base')
+  const partial = await estimateCost([b('claude-sonnet-5-5', 'standard', { output: 1e6 }), b('claude-mystery-9', 'standard', { output: 1e6 }), b('claude-sonnet-5-5', 'fast', { output: 1e6 })])
+  close(partial.usd, 10)
+  assert.deepEqual(partial.unpriced.sort(), ['claude-mystery-9', 'claude-sonnet-5-5 (fast)'])
+  const dataDir = path.join(root, 'pricing-data')
+  await write(path.join(dataDir, 'pricing.json'), JSON.stringify({ 'claude-mystery-9': { in: 1, out: 3, cacheRead: 0.1 }, 'claude-sonnet-5-5': { out: 12 } }))
+  const o = await estimateCost([b('claude-mystery-9', 'standard', { output: 1e6 }), b('claude-sonnet-5-5', 'standard', { output: 1e6, input: 1e6 })], { dataDir })
+  close(o.usd, 3 + 12 + 2)
+  assert.deepEqual(o.unpriced, [])
 })

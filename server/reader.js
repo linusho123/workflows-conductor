@@ -782,6 +782,80 @@ export async function readAgentType(transcriptPath) {
   return t
 }
 
+// Whole-transcript stats: billable usage (for cost estimates) plus the
+// compaction and model-fallback markers the CLI writes. A streamed
+// response is logged once per content block, each line repeating its usage
+// with output_tokens growing — so keep the final (max-output) line per
+// requestId; summing lines over-counts ~2x. Transcripts are append-only:
+// cached per path and read incrementally from the last offset.
+const usageCache = new Map()   // path -> { offset, partial, reqs: Map(requestId -> entry), compactions, modelFallbacks }
+export async function readTranscriptStats(filePath) {
+  if (!filePath) return null
+  let c = usageCache.get(filePath)
+  let fh = null
+  try {
+    fh = await fs.open(filePath, 'r')
+    const { size } = await fh.stat()
+    if (!c || size < c.offset) { c = { offset: 0, partial: '', reqs: new Map(), compactions: [], modelFallbacks: 0 }; usageCache.set(filePath, c) }
+    if (size > c.offset) {
+      const buf = Buffer.alloc(size - c.offset)
+      const { bytesRead } = await fh.read(buf, 0, buf.length, c.offset)
+      c.offset += bytesRead
+      const lines = (c.partial + buf.subarray(0, bytesRead).toString('utf8')).split('\n')
+      c.partial = lines.pop()   // torn/in-progress trailing line: finish it next read
+      for (const seg of lines) addStatsLine(c, seg)
+    }
+  } catch {
+    return null
+  } finally {
+    if (fh) await fh.close().catch(() => {})
+  }
+  const usage = summarizeUsage(c.reqs)
+  return { usage, outputTokens: usage.reduce((s, b) => s + b.output, 0), compactions: c.compactions, modelFallbacks: c.modelFallbacks }
+}
+
+function addStatsLine(c, seg) {
+  const isUsage = seg.includes('"usage"'), isSystem = seg.includes('"compact_boundary"') || seg.includes('"model_refusal_fallback"')
+  if (!isUsage && !isSystem) return
+  let line
+  try { line = JSON.parse(seg) } catch { return }
+  if (line?.type === 'system') {
+    if (line.subtype === 'compact_boundary') {
+      const md = line.compactMetadata ?? {}
+      c.compactions.push({ at: line.timestamp ?? null, trigger: md.trigger ?? null, preTokens: md.preTokens ?? null, durationMs: md.durationMs ?? null })
+    } else if (line.subtype === 'model_refusal_fallback') c.modelFallbacks++
+    return
+  }
+  const reqs = c.reqs
+  const m = line?.message, u = m?.usage
+  if (line?.type !== 'assistant' || !u || typeof m.model !== 'string') return
+  const key = line.requestId ?? m.id
+  if (!key) return
+  const prev = reqs.get(key)
+  if (prev && (prev.u.output_tokens ?? 0) > (u.output_tokens ?? 0)) return
+  reqs.set(key, { model: m.model, u, fast: u.speed === 'fast' || prev?.fast === true })
+}
+
+// Per-request entries -> buckets keyed "model|tier". tier: 'standard',
+// 'fast' (fast mode) or 'long' (prompt > 100K tokens — Haiku 5.5 prices
+// those higher; pricing.js decides whether a model's long tier differs).
+function summarizeUsage(reqs) {
+  const buckets = {}
+  for (const { model, u, fast } of reqs.values()) {
+    const cc = u.cache_creation ?? {}
+    const cw1h = cc.ephemeral_1h_input_tokens ?? 0
+    const cw5m = cc.ephemeral_5m_input_tokens ?? Math.max(0, (u.cache_creation_input_tokens ?? 0) - cw1h)
+    const input = u.input_tokens ?? 0, cacheRead = u.cache_read_input_tokens ?? 0, output = u.output_tokens ?? 0
+    if (!input && !cw5m && !cw1h && !cacheRead && !output) continue   // synthetic / empty
+    const tier = fast ? 'fast' : (input + cw5m + cw1h + cacheRead > 100_000 ? 'long' : 'standard')
+    const b = buckets[model + '|' + tier] ??= { model, tier, requests: 0, input: 0, cacheWrite5m: 0, cacheWrite1h: 0, cacheRead: 0, output: 0, webSearches: 0 }
+    b.requests++
+    b.input += input; b.cacheWrite5m += cw5m; b.cacheWrite1h += cw1h; b.cacheRead += cacheRead; b.output += output
+    b.webSearches += u.server_tool_use?.web_search_requests ?? 0
+  }
+  return Object.values(buckets)
+}
+
 // The agent's goal: its task prompt is the FIRST line of its transcript
 // (type:user). Read only the head of the file — transcripts grow large.
 export async function readTranscriptPrompt(filePath, { maxBytes = 32768, maxChars = 4000 } = {}) {
